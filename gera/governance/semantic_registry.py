@@ -8,7 +8,7 @@ enterprise data systems.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -34,8 +34,26 @@ class MetricDefinition:
     sla_hours: float = 24.0
     lineage: List[str] = field(default_factory=list)
     version: int = 1
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+# Fields that callers may change via update().
+# Structural / audit fields (name, version, created_at) are immutable.
+_UPDATABLE_FIELDS = frozenset({
+    "description",
+    "formula",
+    "owner",
+    "sensitivity",
+    "source_system",
+    "refresh_frequency",
+    "sla_hours",
+    "lineage",
+})
 
 
 class SemanticRegistry:
@@ -50,7 +68,7 @@ class SemanticRegistry:
         self._metrics: Dict[str, MetricDefinition] = {}
 
     def register(self, metric: MetricDefinition) -> MetricDefinition:
-        """Register a new metric. Raises if name already exists."""
+        """Register a new metric. Raises ValueError if name already exists."""
         if metric.name in self._metrics:
             raise ValueError(
                 f"Metric '{metric.name}' already registered. "
@@ -60,21 +78,43 @@ class SemanticRegistry:
         return metric
 
     def get(self, name: str) -> Optional[MetricDefinition]:
-        """Get a metric by name."""
+        """Get a metric by name. Returns None if not found."""
         return self._metrics.get(name)
 
-    def update(self, name: str, **kwargs) -> MetricDefinition:
-        """Update a metric, bumping its version."""
-        metric = self._metrics.get(name)
+    def update(self, metric_name: str, **kwargs) -> MetricDefinition:
+        """
+        Update allowed fields on a metric, bumping its version.
+
+        Only the following fields may be updated:
+        description, formula, owner, sensitivity, source_system,
+        refresh_frequency, sla_hours, lineage.
+
+        Raises:
+            KeyError: if the metric name is not registered.
+            ValueError: if an unknown or immutable field is specified.
+            TypeError: if ``sensitivity`` is not a DataSensitivity instance.
+        """
+        metric = self._metrics.get(metric_name)
         if metric is None:
-            raise KeyError(f"Metric '{name}' not found")
+            raise KeyError(f"Metric '{metric_name}' not found")
+
+        for key in kwargs:
+            if key not in _UPDATABLE_FIELDS:
+                raise ValueError(
+                    f"Field '{key}' cannot be updated via update(). "
+                    f"Allowed fields: {sorted(_UPDATABLE_FIELDS)}"
+                )
 
         for key, value in kwargs.items():
-            if hasattr(metric, key):
-                setattr(metric, key, value)
+            if key == "sensitivity" and not isinstance(value, DataSensitivity):
+                raise TypeError(
+                    f"'sensitivity' must be a DataSensitivity instance, "
+                    f"got {type(value).__name__}"
+                )
+            setattr(metric, key, value)
 
         metric.version += 1
-        metric.updated_at = datetime.utcnow()
+        metric.updated_at = datetime.now(timezone.utc)
         return metric
 
     def search(self, query: str) -> List[MetricDefinition]:

@@ -6,8 +6,9 @@ automatic SLA enforcement and escalation. Designed for SOX
 Section 404 compliance workflows.
 """
 
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -45,7 +46,9 @@ class GERAException:
     description: str
     severity: ExceptionSeverity
     status: ExceptionStatus = ExceptionStatus.OPEN
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     assigned_to: Optional[str] = None
     resolved_at: Optional[datetime] = None
     resolution_notes: Optional[str] = None
@@ -53,7 +56,7 @@ class GERAException:
     @property
     def age_hours(self) -> float:
         """Hours since exception was created."""
-        end = self.resolved_at or datetime.utcnow()
+        end = self.resolved_at or datetime.now(timezone.utc)
         return (end - self.created_at).total_seconds() / 3600
 
     @property
@@ -70,12 +73,14 @@ class ExceptionRouter:
     FIFO exception queue with automatic SLA enforcement.
 
     Routes reconciliation exceptions, tracks resolution,
-    and escalates overdue items.
+    and escalates overdue items.  Thread-safe: route() serialises
+    counter increments and queue appends under an internal lock.
     """
 
     def __init__(self):
         self._queue: List[GERAException] = []
         self._counter: int = 0
+        self._lock = threading.Lock()
 
     def route(
         self,
@@ -84,14 +89,15 @@ class ExceptionRouter:
         severity: ExceptionSeverity = ExceptionSeverity.MEDIUM,
     ) -> GERAException:
         """Create and route a new exception."""
-        self._counter += 1
-        exc = GERAException(
-            exception_id=f"EXC-{self._counter:06d}",
-            source=source,
-            description=description,
-            severity=severity,
-        )
-        self._queue.append(exc)
+        with self._lock:
+            self._counter += 1
+            exc = GERAException(
+                exception_id=f"EXC-{self._counter:06d}",
+                source=source,
+                description=description,
+                severity=severity,
+            )
+            self._queue.append(exc)
         return exc
 
     def resolve(
@@ -103,7 +109,7 @@ class ExceptionRouter:
         for exc in self._queue:
             if exc.exception_id == exception_id:
                 exc.status = ExceptionStatus.RESOLVED
-                exc.resolved_at = datetime.utcnow()
+                exc.resolved_at = datetime.now(timezone.utc)
                 exc.resolution_notes = resolution_notes
                 return True
         return False
@@ -121,7 +127,7 @@ class ExceptionRouter:
     def open_count(self) -> int:
         return sum(
             1 for e in self._queue
-            if e.status not in (ExceptionStatus.RESOLVED,)
+            if e.status != ExceptionStatus.RESOLVED
         )
 
     def get_queue_summary(self) -> Dict:

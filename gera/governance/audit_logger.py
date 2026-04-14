@@ -11,11 +11,12 @@ NIST CSF 2.0 DE.CM continuous monitoring requirements.
 
 import hashlib
 import json
-import uuid
+import math
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class EventType(Enum):
@@ -52,6 +53,8 @@ class AuditLogger:
 
     Events are immutable once logged. The hash chain allows
     verification that no events have been modified or deleted.
+    Thread-safe: concurrent log() calls are serialised by an
+    internal lock to guarantee unique event IDs and chain integrity.
 
     Args:
         retention_days: Log retention period (default: 2555 ~7 years for SOX)
@@ -61,11 +64,53 @@ class AuditLogger:
         self.retention_days = retention_days
         self._events: List[AuditEvent] = []
         self._last_hash: str = "genesis"
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_value(value: Any) -> Any:
+        """
+        Recursively replace non-RFC-7159-compliant float values.
+
+        Python's json module serialises float('inf') as the bare token
+        ``Infinity``, which is rejected by strict JSON parsers (BigQuery,
+        Athena, etc.).  Replace with labelled strings before export so the
+        output is always valid JSON.
+        """
+        if isinstance(value, float):
+            if math.isnan(value):
+                return "NaN"
+            if math.isinf(value):
+                return "Infinity" if value > 0 else "-Infinity"
+            return value
+        if isinstance(value, dict):
+            return {k: AuditLogger._sanitize_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [AuditLogger._sanitize_value(v) for v in value]
+        return value
 
     def _compute_hash(self, event_data: Dict[str, Any]) -> str:
         """Compute SHA-256 hash of event data."""
         serialized = json.dumps(event_data, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode()).hexdigest()
+
+    def _cleanup_expired(self) -> None:
+        """
+        Remove in-memory events older than retention_days.
+
+        Called inside the lock on every log() so memory is bounded.
+        In production, events should be flushed to a persistent backend
+        before they age out — this method only trims the in-memory copy.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
+        self._events = [e for e in self._events if e.timestamp >= cutoff]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def log(
         self,
@@ -76,37 +121,41 @@ class AuditLogger:
         details: Optional[Dict[str, Any]] = None,
     ) -> AuditEvent:
         """Log an audit event with hash chain linking."""
-        event_id = f"AUD-{len(self._events) + 1:08d}"
-        timestamp = datetime.utcnow()
         details = details or {}
 
-        event_data = {
-            "event_id": event_id,
-            "event_type": event_type.value,
-            "timestamp": str(timestamp),
-            "actor": actor,
-            "action": action,
-            "resource": resource,
-            "details": details,
-            "previous_hash": self._last_hash,
-        }
+        with self._lock:
+            event_id = f"AUD-{len(self._events) + 1:08d}"
+            timestamp = datetime.now(timezone.utc)
 
-        event_hash = self._compute_hash(event_data)
+            event_data = {
+                "event_id": event_id,
+                "event_type": event_type.value,
+                "timestamp": str(timestamp),
+                "actor": actor,
+                "action": action,
+                "resource": resource,
+                "details": details,
+                "previous_hash": self._last_hash,
+            }
 
-        event = AuditEvent(
-            event_id=event_id,
-            event_type=event_type,
-            timestamp=timestamp,
-            actor=actor,
-            action=action,
-            resource=resource,
-            details=details,
-            previous_hash=self._last_hash,
-            event_hash=event_hash,
-        )
+            event_hash = self._compute_hash(event_data)
 
-        self._events.append(event)
-        self._last_hash = event_hash
+            event = AuditEvent(
+                event_id=event_id,
+                event_type=event_type,
+                timestamp=timestamp,
+                actor=actor,
+                action=action,
+                resource=resource,
+                details=details,
+                previous_hash=self._last_hash,
+                event_hash=event_hash,
+            )
+
+            self._events.append(event)
+            self._last_hash = event_hash
+            self._cleanup_expired()
+
         return event
 
     def log_gate_decision(
@@ -139,14 +188,41 @@ class AuditLogger:
         )
 
     def verify_chain(self) -> bool:
-        """Verify the integrity of the entire hash chain."""
+        """
+        Verify the integrity of the entire hash chain.
+
+        Returns True if the chain is intact, False if any event has been
+        tampered with or deleted.  For forensic detail on the first
+        violation found, use :meth:`verify_chain_detail`.
+        """
+        valid, _ = self.verify_chain_detail()
+        return valid
+
+    def verify_chain_detail(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Verify the hash chain and return the first violation found.
+
+        Returns:
+            (True, None) if the chain is intact.
+            (False, detail_dict) where detail_dict contains:
+                - event_index: position of the violating event
+                - event_id: ID of the violating event
+                - violation: "prev_hash_mismatch" or "hash_mismatch"
+                - expected / actual fields describing the discrepancy
+        """
         if not self._events:
-            return True
+            return True, None
 
         expected_prev = "genesis"
-        for event in self._events:
+        for i, event in enumerate(self._events):
             if event.previous_hash != expected_prev:
-                return False
+                return False, {
+                    "event_index": i,
+                    "event_id": event.event_id,
+                    "violation": "prev_hash_mismatch",
+                    "expected_prev_hash": expected_prev,
+                    "actual_prev_hash": event.previous_hash,
+                }
 
             event_data = {
                 "event_id": event.event_id,
@@ -160,11 +236,17 @@ class AuditLogger:
             }
             computed = self._compute_hash(event_data)
             if computed != event.event_hash:
-                return False
+                return False, {
+                    "event_index": i,
+                    "event_id": event.event_id,
+                    "violation": "hash_mismatch",
+                    "expected_hash": computed,
+                    "actual_hash": event.event_hash,
+                }
 
             expected_prev = event.event_hash
 
-        return True
+        return True, None
 
     def query(
         self,
@@ -186,7 +268,13 @@ class AuditLogger:
         return results
 
     def export(self, format: str = "json") -> str:
-        """Export audit log as JSON."""
+        """
+        Export audit log as valid RFC-7159 JSON.
+
+        Non-finite float values (inf, -inf, NaN) in event details are
+        replaced with labelled strings so the output is accepted by all
+        standard JSON parsers.
+        """
         records = []
         for e in self._events:
             records.append({
@@ -196,7 +284,7 @@ class AuditLogger:
                 "actor": e.actor,
                 "action": e.action,
                 "resource": e.resource,
-                "details": e.details,
+                "details": self._sanitize_value(e.details),
                 "previous_hash": e.previous_hash,
                 "event_hash": e.event_hash,
             })

@@ -6,6 +6,20 @@
 #
 # NIST CSF 2.0 Controls: PR.DS-01 (Data Security), DE.CM-01 (Monitoring)
 
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+}
+
 variable "project_id" {
   description = "GCP project ID"
   type        = string
@@ -84,4 +98,23 @@ resource "google_bigquery_table" "access_log" {
     { name = "ip_address",        type = "STRING",    mode = "NULLABLE" },
     { name = "event_hash",        type = "STRING",    mode = "REQUIRED" },
   ])
+}
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+output "dataset_id" {
+  description = "BigQuery dataset ID for the audit logs"
+  value       = google_bigquery_dataset.audit_logs.dataset_id
+}
+
+output "gate_decisions_table_id" {
+  description = "Table ID for pipeline gate decision audit log"
+  value       = google_bigquery_table.gate_decisions.table_id
+}
+
+output "access_log_table_id" {
+  description = "Table ID for data access audit log"
+  value       = google_bigquery_table.access_log.table_id
 }

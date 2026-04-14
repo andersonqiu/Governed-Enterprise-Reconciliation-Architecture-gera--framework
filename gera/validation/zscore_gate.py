@@ -20,7 +20,7 @@ References:
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,7 +66,9 @@ class ZScoreResult:
     batch_anomaly_rate: float
     baseline_mean: float
     baseline_std: float
-    evaluation_timestamp: datetime = field(default_factory=datetime.utcnow)
+    evaluation_timestamp: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
     @property
     def pass_rate(self) -> float:
@@ -88,7 +90,8 @@ class ZScoreGate:
         block_threshold: Z-Score threshold for BLOCK (default: 4.0)
         window_days: Rolling baseline window in days (default: 90)
         min_observations: Minimum records for valid baseline (default: 30)
-        batch_anomaly_rate_limit: Max anomaly rate before batch BLOCK (default: 0.10)
+        batch_anomaly_rate_limit: Max anomaly rate before batch BLOCK (default: 0.10),
+            must be strictly between 0 and 1.
     """
 
     def __init__(
@@ -107,6 +110,11 @@ class ZScoreGate:
             raise ValueError("window_days must be positive")
         if min_observations <= 0:
             raise ValueError("min_observations must be positive")
+        if not (0 < batch_anomaly_rate_limit < 1):
+            raise ValueError(
+                "batch_anomaly_rate_limit must be strictly between 0 and 1, "
+                f"got {batch_anomaly_rate_limit}"
+            )
 
         self.sigma_threshold = sigma_threshold
         self.block_threshold = block_threshold
@@ -127,7 +135,7 @@ class ZScoreGate:
             whether sufficient observations exist for a reliable baseline.
         """
         if timestamps is not None:
-            cutoff = datetime.utcnow() - timedelta(days=self.window_days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=self.window_days)
             filtered = [
                 v for v, t in zip(historical_values, timestamps)
                 if t >= cutoff
@@ -165,12 +173,12 @@ class ZScoreGate:
         return Anomaly(
             record_id=record_id,
             value=value,
-            z_score=round(z_score, 2),
+            z_score=round(z_score, 2) if z_score != float('inf') else z_score,
             decision=decision,
             baseline_mean=round(baseline_mean, 2),
             baseline_std=round(baseline_std, 2),
             segment=segment,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
 
     def validate(
@@ -183,8 +191,10 @@ class ZScoreGate:
         """
         Validate a batch of values against historical baseline.
 
-        If historical data is insufficient (< min_observations),
-        all records PASS with a warning.
+        If historical data is insufficient (< min_observations), all records
+        are flagged for manual review rather than passed silently.  Passing
+        unvalidated records without any signal is a compliance risk —
+        FLAG ensures the batch is reviewed before downstream processing.
         """
         mean, std, is_valid = self.compute_baseline(historical_values, timestamps)
 
@@ -192,14 +202,25 @@ class ZScoreGate:
             record_ids = [f"record-{i}" for i in range(len(values))]
 
         if not is_valid:
+            flagged_anomalies = [
+                Anomaly(
+                    record_id=rid,
+                    value=val,
+                    z_score=0.0,
+                    decision=GateDecision.FLAG,
+                    baseline_mean=0.0,
+                    baseline_std=0.0,
+                )
+                for val, rid in zip(values, record_ids)
+            ]
             return ZScoreResult(
                 total_records=len(values),
-                passed=len(values),
-                flagged=0,
+                passed=0,
+                flagged=len(values),
                 blocked=0,
-                anomalies=[],
-                gate_decision=GateDecision.PASS,
-                batch_anomaly_rate=0.0,
+                anomalies=flagged_anomalies,
+                gate_decision=GateDecision.FLAG,
+                batch_anomaly_rate=1.0,
                 baseline_mean=mean,
                 baseline_std=std,
             )

@@ -8,6 +8,18 @@ from gera.validation.reconciliation_checks import ReconciliationCheck, CheckStat
 from gera.validation.reasonableness import ReasonablenessCheck
 
 
+# ---------------------------------------------------------------------------
+# Deterministic baseline shared across Z-Score tests.
+# mean ≈ 100, std ≈ 10 — derived from a fixed seed so tests never flake.
+# ---------------------------------------------------------------------------
+_RNG = np.random.default_rng(42)
+_HISTORICAL = _RNG.normal(100, 10, 100).tolist()
+# Actual stats (pre-computed to avoid recomputing in every test):
+_HIST_ARR = np.array(_HISTORICAL)
+_HIST_MEAN = float(np.mean(_HIST_ARR))
+_HIST_STD = float(np.std(_HIST_ARR, ddof=1))
+
+
 class TestZScoreGate:
     """Tests for ZScoreGate anomaly detection."""
 
@@ -17,55 +29,81 @@ class TestZScoreGate:
             block_threshold=4.0,
             min_observations=30,
         )
-        np.random.seed(42)
-        self.historical = np.random.normal(100, 10, 100).tolist()
 
     def test_normal_values_pass(self):
         result = self.gate.validate(
-            values=[100.0, 105.0, 95.0],
-            historical_values=self.historical,
+            values=[_HIST_MEAN, _HIST_MEAN + 0.5 * _HIST_STD],
+            historical_values=_HISTORICAL,
         )
         assert result.gate_decision == GateDecision.PASS
-        assert result.passed == 3
+        assert result.passed == 2
         assert result.flagged == 0
         assert result.blocked == 0
 
-    def test_extreme_value_flagged(self):
+    def test_value_in_flag_zone_is_flagged(self):
+        """
+        A value at 3.0σ (between FLAG=2.5σ and BLOCK=4.0σ) must FLAG the individual
+        record and produce a FLAG gate decision when the batch anomaly rate stays
+        below the 10 % limit (1 flagged out of 20 = 5 %).
+        """
+        flag_value = _HIST_MEAN + 3.0 * _HIST_STD
+        # 19 normal + 1 flag → 5 % anomaly rate, safely below 10 % batch limit.
+        normal_values = [_HIST_MEAN] * 19
         result = self.gate.validate(
-            values=[100.0, 135.0],  # 135 is ~3.5 sigma from mean ~100
-            historical_values=self.historical,
+            values=normal_values + [flag_value],
+            historical_values=_HISTORICAL,
         )
-        assert result.flagged >= 1 or result.blocked >= 1
+        assert result.flagged == 1
+        assert result.blocked == 0
+        assert result.gate_decision == GateDecision.FLAG
 
     def test_very_extreme_value_blocked(self):
+        block_value = _HIST_MEAN + 10 * _HIST_STD
         result = self.gate.validate(
-            values=[100.0, 200.0],  # 200 is ~10 sigma
-            historical_values=self.historical,
+            values=[100.0, block_value],
+            historical_values=_HISTORICAL,
         )
         assert result.blocked >= 1
         assert result.gate_decision == GateDecision.BLOCK
 
-    def test_insufficient_history_passes(self):
+    def test_insufficient_history_flags_all_records(self):
+        """
+        When historical data is below min_observations, all records must be
+        FLAG (not PASS).  Silently passing unvalidated financial data is a
+        compliance risk — a FLAG ensures the batch requires manual review.
+        """
         result = self.gate.validate(
             values=[100.0, 500.0],
-            historical_values=[100.0] * 5,  # Only 5, need 30
+            historical_values=[100.0] * 5,  # Only 5 observations, need 30.
         )
-        assert result.gate_decision == GateDecision.PASS
-        assert result.passed == 2
+        assert result.gate_decision == GateDecision.FLAG
+        assert result.flagged == 2
+        assert result.passed == 0
+        assert result.blocked == 0
 
     def test_batch_anomaly_rate_blocks(self):
-        # More than 10% anomalies should trigger batch BLOCK
-        values = [100.0] * 8 + [500.0, 600.0]  # 20% anomaly rate
-        result = self.gate.validate(
-            values=values,
-            historical_values=self.historical,
-        )
+        # More than 10 % anomalies should trigger batch BLOCK.
+        values = [_HIST_MEAN] * 8 + [
+            _HIST_MEAN + 5 * _HIST_STD,
+            _HIST_MEAN + 6 * _HIST_STD,
+        ]  # 20 % anomaly rate
+        result = self.gate.validate(values=values, historical_values=_HISTORICAL)
         assert result.gate_decision == GateDecision.BLOCK
 
+    def test_batch_anomaly_rate_limit_validation(self):
+        """batch_anomaly_rate_limit must be strictly between 0 and 1."""
+        with pytest.raises(ValueError, match="batch_anomaly_rate_limit"):
+            ZScoreGate(batch_anomaly_rate_limit=0.0)
+        with pytest.raises(ValueError, match="batch_anomaly_rate_limit"):
+            ZScoreGate(batch_anomaly_rate_limit=1.0)
+        with pytest.raises(ValueError, match="batch_anomaly_rate_limit"):
+            ZScoreGate(batch_anomaly_rate_limit=999)
+
     def test_segmented_validation(self):
+        rng = np.random.default_rng(7)
         seg_hist = {
-            "revenue": np.random.normal(1000, 100, 50).tolist(),
-            "cost": np.random.normal(500, 50, 50).tolist(),
+            "revenue": rng.normal(1000, 100, 50).tolist(),
+            "cost": rng.normal(500, 50, 50).tolist(),
         }
         result = self.gate.validate_segmented(
             values=[1050.0, 520.0],
@@ -75,22 +113,22 @@ class TestZScoreGate:
         assert result.gate_decision == GateDecision.PASS
 
     def test_zero_std_handling(self):
-        # All same values -> std = 0
+        """Constant historical values (std=0) should flag any deviation."""
         result = self.gate.validate(
             values=[100.0, 100.0, 101.0],
             historical_values=[100.0] * 50,
         )
-        # 101.0 should be flagged/blocked since std=0 and it differs
         assert result.flagged + result.blocked >= 1
 
     def test_record_ids_preserved(self):
+        block_value = _HIST_MEAN + 10 * _HIST_STD
         result = self.gate.validate(
-            values=[100.0, 500.0],
-            historical_values=self.historical,
+            values=[_HIST_MEAN, block_value],
+            historical_values=_HISTORICAL,
             record_ids=["MY-001", "MY-002"],
         )
-        if result.anomalies:
-            assert result.anomalies[0].record_id == "MY-002"
+        assert result.anomalies
+        assert result.anomalies[0].record_id == "MY-002"
 
     def test_invalid_params_raise(self):
         with pytest.raises(ValueError):
@@ -102,6 +140,10 @@ class TestZScoreGate:
         with pytest.raises(ValueError):
             ZScoreGate(min_observations=0)
 
+
+# ---------------------------------------------------------------------------
+# Layer 2 — ReconciliationCheck
+# ---------------------------------------------------------------------------
 
 class TestReconciliationCheck:
     """Tests for deterministic reconciliation checks."""
@@ -119,11 +161,11 @@ class TestReconciliationCheck:
 
     def test_amount_within_tolerance(self):
         result = self.checker.check_amount(10000.0, 10050.0)
-        assert result.status == CheckStatus.PASS  # 0.5% < 1%
+        assert result.status == CheckStatus.PASS  # 0.5 % < 1 %
 
     def test_amount_beyond_tolerance(self):
         result = self.checker.check_amount(10000.0, 10200.0)
-        assert result.status == CheckStatus.FAIL  # 2% > 1%
+        assert result.status == CheckStatus.FAIL  # 2 % > 1 %
 
     def test_completeness_all_present(self):
         result = self.checker.check_completeness(
@@ -138,6 +180,10 @@ class TestReconciliationCheck:
         assert result.status == CheckStatus.FAIL
 
 
+# ---------------------------------------------------------------------------
+# Layer 2 — ReasonablenessCheck
+# ---------------------------------------------------------------------------
+
 class TestReasonablenessCheck:
     """Tests for period-over-period variance."""
 
@@ -146,8 +192,8 @@ class TestReasonablenessCheck:
 
     def test_within_threshold(self):
         result = self.checker.check_period_variance(1100.0, 1000.0)
-        assert result.status == CheckStatus.PASS  # 10% < 15%
+        assert result.status == CheckStatus.PASS  # 10 % < 15 %
 
     def test_exceeds_threshold(self):
         result = self.checker.check_period_variance(1200.0, 1000.0)
-        assert result.status == CheckStatus.FAIL  # 20% > 15%
+        assert result.status == CheckStatus.FAIL  # 20 % > 15 %

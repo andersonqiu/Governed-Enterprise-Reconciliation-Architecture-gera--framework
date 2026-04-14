@@ -5,6 +5,20 @@
 #
 # NIST CSF 2.0 Control: PR.AA-01 (Identity Management & Access Control)
 
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+}
+
 variable "project_id" {
   description = "GCP project ID"
   type        = string
@@ -61,4 +75,28 @@ resource "google_project_iam_custom_role" "gera_compliance_auditor" {
     "bigquery.jobs.create",
     "logging.logEntries.list",
   ]
+}
+
+# ---------------------------------------------------------------------------
+# Outputs — consumed by bigquery_rls/iam.tf to bind groups to these roles.
+# ---------------------------------------------------------------------------
+
+output "gera_analyst_role_id" {
+  description = "Full resource ID of the gera_analyst custom role"
+  value       = google_project_iam_custom_role.gera_analyst.id
+}
+
+output "gera_finance_lead_role_id" {
+  description = "Full resource ID of the gera_finance_lead custom role"
+  value       = google_project_iam_custom_role.gera_finance_lead.id
+}
+
+output "gera_data_engineer_role_id" {
+  description = "Full resource ID of the gera_data_engineer custom role"
+  value       = google_project_iam_custom_role.gera_data_engineer.id
+}
+
+output "gera_compliance_auditor_role_id" {
+  description = "Full resource ID of the gera_compliance_auditor custom role"
+  value       = google_project_iam_custom_role.gera_compliance_auditor.id
 }

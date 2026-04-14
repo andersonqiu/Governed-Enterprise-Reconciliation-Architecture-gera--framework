@@ -102,6 +102,8 @@ class DeterministicMatcher:
         value_fields: Optional[List[str]] = None,
         normalize_keys: bool = True,
     ):
+        if not key_fields:
+            raise ValueError("key_fields must not be empty")
         self.key_fields = key_fields
         self.value_fields = value_fields or []
         self.normalize_keys = normalize_keys
