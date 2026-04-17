@@ -35,10 +35,20 @@ class MatchResult:
 
 
 class MatchReport:
-    """Aggregated matching report."""
+    """Aggregated matching report.
 
-    def __init__(self):
+    ``source_count`` is recorded at construction time from the true
+    number of input source records so that :attr:`match_rate` divides by
+    the correct denominator. Deriving the denominator from ``results``
+    is unsafe once duplicate detection emits one DUPLICATE row per
+    input record on *both* sides — target-side duplicate rows would
+    otherwise be counted as if they were source records and inflate the
+    denominator.
+    """
+
+    def __init__(self, source_count: int = 0):
         self.results: List[MatchResult] = []
+        self.source_count: int = source_count
 
     def add(self, result: MatchResult):
         self.results.append(result)
@@ -70,13 +80,18 @@ class MatchReport:
 
     @property
     def match_rate(self) -> float:
-        total_source = sum(
-            1 for r in self.results
-            if r.status != MatchStatus.UNMATCHED_TARGET
-        )
-        if total_source == 0:
+        """Fraction of source records that cleanly matched (MATCHED or
+        CONFLICT).
+
+        Denominator is the number of source records passed to
+        :meth:`DeterministicMatcher.match` — not the number of result
+        rows. Target-side DUPLICATE rows exist as their own result
+        entries but are not source records and must not inflate the
+        denominator.
+        """
+        if self.source_count <= 0:
             return 0.0
-        return self.matched_count / total_source
+        return self.matched_count / self.source_count
 
     @property
     def is_fully_reconciled(self) -> bool:
@@ -126,48 +141,81 @@ class DeterministicMatcher:
         """
         Match source records against target records.
 
-        Returns a MatchReport with results for every record
-        in both source and target.
-        """
-        report = MatchReport()
+        Returns a MatchReport with results for every record in both source
+        and target.
 
-        # Build target index
+        Duplicate handling: if a key appears more than once on either the
+        source OR the target side, every record under that key is emitted
+        as :class:`MatchStatus.DUPLICATE` so the caller can route each
+        ambiguous row to manual review. A single source record against
+        multiple target records (many-to-one) is explicitly NOT silently
+        matched — that was a correctness bug in earlier versions because
+        it masked duplicate postings / ledger forks.
+        """
+        report = MatchReport(source_count=len(source_records))
+
+        # Build indexes on both sides. Duplicates on either side surface
+        # the same way so many-to-one forks and split postings cannot
+        # slip through as spurious MATCHED results.
+        source_index: Dict[tuple, List[Dict[str, Any]]] = {}
+        for rec in source_records:
+            source_index.setdefault(self._extract_key(rec), []).append(rec)
+
         target_index: Dict[tuple, List[Dict[str, Any]]] = {}
         for rec in target_records:
-            key = self._extract_key(rec)
-            target_index.setdefault(key, []).append(rec)
+            target_index.setdefault(self._extract_key(rec), []).append(rec)
 
-        matched_target_keys = set()
+        # Any key that appears >1 time on EITHER side is ambiguous.
+        duplicate_keys = {
+            key
+            for key in set(source_index) | set(target_index)
+            if len(source_index.get(key, [])) > 1
+            or len(target_index.get(key, [])) > 1
+        }
 
-        # Match each source record
-        for src in source_records:
-            src_key = self._extract_key(src)
-            targets = target_index.get(src_key, [])
-
-            if not targets:
+        # Emit one DUPLICATE result per input record on the ambiguous key,
+        # on both sides. This preserves a 1:1 relationship between input
+        # rows and output rows for auditability.
+        for key in duplicate_keys:
+            src_recs = source_index.get(key, [])
+            tgt_recs = target_index.get(key, [])
+            sample_src = src_recs[0] if src_recs else None
+            sample_tgt = tgt_recs[0] if tgt_recs else None
+            for s in src_recs:
                 report.add(MatchResult(
-                    source_key=src_key,
+                    source_key=key,
+                    target_key=key if tgt_recs else None,
+                    status=MatchStatus.DUPLICATE,
+                    source_record=s,
+                    target_record=sample_tgt,
+                ))
+            for t in tgt_recs:
+                report.add(MatchResult(
+                    source_key=key if src_recs else None,
+                    target_key=key,
+                    status=MatchStatus.DUPLICATE,
+                    source_record=sample_src,
+                    target_record=t,
+                ))
+
+        # Now walk the source index once more for the unambiguous 1:1 case.
+        for key, src_recs in source_index.items():
+            if key in duplicate_keys:
+                continue
+            src = src_recs[0]
+            tgt_recs = target_index.get(key, [])
+            if not tgt_recs:
+                report.add(MatchResult(
+                    source_key=key,
                     target_key=None,
                     status=MatchStatus.UNMATCHED_SOURCE,
                     source_record=src,
                 ))
                 continue
 
-            if len(targets) > 1:
-                report.add(MatchResult(
-                    source_key=src_key,
-                    target_key=src_key,
-                    status=MatchStatus.DUPLICATE,
-                    source_record=src,
-                    target_record=targets[0],
-                ))
-                matched_target_keys.add(src_key)
-                continue
-
-            tgt = targets[0]
-            matched_target_keys.add(src_key)
-
-            # Check for value conflicts
+            # Invariant: tgt_recs has exactly one record, because key
+            # is not in duplicate_keys.
+            tgt = tgt_recs[0]
             conflicts = []
             for vf in self.value_fields:
                 sv = src.get(vf)
@@ -177,8 +225,8 @@ class DeterministicMatcher:
 
             if conflicts:
                 report.add(MatchResult(
-                    source_key=src_key,
-                    target_key=src_key,
+                    source_key=key,
+                    target_key=key,
                     status=MatchStatus.CONFLICT,
                     source_record=src,
                     target_record=tgt,
@@ -186,22 +234,23 @@ class DeterministicMatcher:
                 ))
             else:
                 report.add(MatchResult(
-                    source_key=src_key,
-                    target_key=src_key,
+                    source_key=key,
+                    target_key=key,
                     status=MatchStatus.MATCHED,
                     source_record=src,
                     target_record=tgt,
                 ))
 
-        # Report unmatched targets
-        for key, targets in target_index.items():
-            if key not in matched_target_keys:
-                for tgt in targets:
-                    report.add(MatchResult(
-                        source_key=None,
-                        target_key=key,
-                        status=MatchStatus.UNMATCHED_TARGET,
-                        target_record=tgt,
-                    ))
+        # Report targets whose keys have no source counterpart.
+        for key, tgt_recs in target_index.items():
+            if key in source_index or key in duplicate_keys:
+                continue
+            for tgt in tgt_recs:
+                report.add(MatchResult(
+                    source_key=None,
+                    target_key=key,
+                    status=MatchStatus.UNMATCHED_TARGET,
+                    target_record=tgt,
+                ))
 
         return report

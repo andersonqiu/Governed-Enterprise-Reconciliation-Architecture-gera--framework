@@ -9,14 +9,17 @@ Designed for SOX Section 404 (7-year retention) and
 NIST CSF 2.0 DE.CM continuous monitoring requirements.
 """
 
+import copy
 import hashlib
 import json
 import math
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping as MappingType, Optional, Tuple
 
 
 class EventType(Enum):
@@ -33,18 +36,97 @@ class EventType(Enum):
     SYSTEM_EVENT = "system_event"
 
 
+def _deep_freeze(obj: Any) -> Any:
+    """Recursively convert *obj* into an immutable structure.
+
+    The transformation is:
+
+    * ``Mapping`` → read-only ``MappingProxyType`` (values recursed).
+    * ``list`` / ``tuple`` → ``tuple`` (elements recursed). Tuples still
+      have to be walked because they may contain mutable members
+      (dicts, sets, lists) even though the tuple itself is immutable.
+    * ``set`` / ``frozenset`` → ``frozenset`` (elements recursed).
+    * ``bytearray`` → ``bytes``.
+    * Everything else is returned as-is.
+
+    The combination of this function at log time with
+    :func:`_to_plain` at hash time guarantees that the stored payload is
+    fully immutable AND that the exact byte-level representation fed to
+    SHA-256 is deterministic regardless of the insertion order the
+    caller happened to use for any set-typed value.
+    """
+    if isinstance(obj, Mapping):
+        return MappingProxyType({k: _deep_freeze(v) for k, v in obj.items()})
+    if isinstance(obj, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in obj)
+    if isinstance(obj, (set, frozenset)):
+        return frozenset(_deep_freeze(v) for v in obj)
+    if isinstance(obj, bytearray):
+        return bytes(obj)
+    return obj
+
+
+def _to_plain(obj: Any) -> Any:
+    """Inverse of :func:`_deep_freeze`: render a frozen structure as plain
+    JSON-compatible containers.
+
+    Every collection type is mapped to dict/list so that ``json.dumps``
+    produces the same bytes whether called at log-time (on the plain
+    input) or at verify-time (on the frozen copy). Frozensets in
+    particular are serialised as *sorted* lists so insertion-order
+    variation on the caller side cannot change the hash.
+    """
+    if isinstance(obj, Mapping):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (tuple, list)):
+        return [_to_plain(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        # Canonicalise as a sorted list so the hash is independent of
+        # set iteration order. Fall back to string sort when the
+        # elements are not directly comparable.
+        plain = [_to_plain(v) for v in obj]
+        try:
+            plain.sort()
+        except TypeError:
+            plain.sort(key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return plain
+    if isinstance(obj, (bytes, bytearray)):
+        # Non-JSON-native; surface as a string so json.dumps doesn't
+        # have to fall back to default=str (which would serialise bytes
+        # as their repr, an unstable form).
+        return bytes(obj).hex()
+    return obj
+
+
 @dataclass(frozen=True)
 class AuditEvent:
-    """Immutable audit event with hash chain link."""
+    """
+    Immutable audit event with hash chain link.
+
+    ``details`` is deep-copied and deep-frozen at construction time so that
+    callers cannot mutate the payload after logging, even via nested
+    references. The exposed value is a read-only MappingProxyType whose
+    nested dicts are likewise read-only and whose nested lists are tuples.
+    """
     event_id: str
     event_type: EventType
     timestamp: datetime
     actor: str
     action: str
     resource: str
-    details: Dict[str, Any]
+    details: MappingType[str, Any]
     previous_hash: str
     event_hash: str
+
+    def __post_init__(self) -> None:
+        # Deep-copy first to isolate from any still-held caller reference,
+        # then deep-freeze so post-logging mutation cannot tamper with the
+        # stored payload. frozen=True on the dataclass only blocks field
+        # reassignment, not mutation of nested containers, so we need this
+        # explicit freeze.
+        if not isinstance(self.details, MappingProxyType):
+            isolated = copy.deepcopy(dict(self.details))
+            object.__setattr__(self, "details", _deep_freeze(isolated))
 
 
 class AuditLogger:
@@ -69,6 +151,20 @@ class AuditLogger:
         # know nothing could possibly have aged out.  Without this, log()
         # becomes O(n) and append-heavy workloads degrade to O(n²).
         self._oldest_timestamp: Optional[datetime] = None
+        # Chain anchor: event_hash of the most recently purged event, or
+        # "genesis" if nothing has been purged yet. verify_chain() starts
+        # from this anchor so events surviving retention purge remain
+        # verifiable. Without it, the first surviving event's
+        # previous_hash (which points at a purged predecessor) would be
+        # falsely flagged as tampering.
+        self._anchor_hash: str = "genesis"
+        # Monotonic event-ID counter. Must be independent of
+        # ``len(self._events)`` so that retention purge cannot reuse an
+        # already-assigned ID. The ID is also the ordering key for the
+        # Athena / BigQuery ``v_audit_chain_verification`` view
+        # (``LAG(event_hash) OVER (ORDER BY event_id)``), so reuse would
+        # break chain verification in the warehouse.
+        self._next_event_seq: int = 1
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -113,6 +209,13 @@ class AuditLogger:
         we only need to scan when the oldest known timestamp is actually
         past the retention cutoff.  Skipping the scan keeps log() O(1)
         amortised instead of O(n) per call.
+
+        Chain anchor: when events are removed, ``self._anchor_hash`` is
+        advanced to the ``event_hash`` of the most recently purged event
+        so that :meth:`verify_chain_detail` can still validate the
+        remaining events — the first surviving event's ``previous_hash``
+        now points at the anchor rather than at a genesis that no longer
+        corresponds to the current set of events.
         """
         if self._oldest_timestamp is None:
             return
@@ -130,12 +233,17 @@ class AuditLogger:
                 first_keep = i
                 break
         else:
-            # Every event expired.
+            # Every event expired. Advance anchor to the last event's
+            # hash so a subsequent log() still chains correctly and
+            # verify_chain() on the (now empty) events list returns True.
+            self._anchor_hash = self._events[-1].event_hash
             self._events = []
             self._oldest_timestamp = None
             return
 
         if first_keep > 0:
+            # Advance anchor to the hash of the last purged event.
+            self._anchor_hash = self._events[first_keep - 1].event_hash
             self._events = self._events[first_keep:]
             self._oldest_timestamp = self._events[0].timestamp
 
@@ -155,8 +263,23 @@ class AuditLogger:
         details = details or {}
 
         with self._lock:
-            event_id = f"AUD-{len(self._events) + 1:08d}"
+            # Use a monotonic sequence — NOT len(self._events) — so that
+            # retention purge never recycles a previously-assigned ID.
+            # The downstream warehouse view orders the chain by
+            # event_id; reusing an ID would invalidate that ordering.
+            event_id = f"AUD-{self._next_event_seq:08d}"
+            self._next_event_seq += 1
             timestamp = datetime.now(timezone.utc)
+
+            # Isolate payload from caller so post-logging mutation cannot
+            # retroactively change what was hashed. Deep-copy first, then
+            # deep-freeze so nested sets / tuples / bytearrays cannot be
+            # mutated through a caller-held reference; finally hash the
+            # canonical plain form so the hash agrees with the one
+            # recomputed by verify_chain_detail() at verify time.
+            isolated_details = copy.deepcopy(dict(details))
+            frozen_details = _deep_freeze(isolated_details)
+            canonical_details = _to_plain(frozen_details)
 
             event_data = {
                 "event_id": event_id,
@@ -165,7 +288,7 @@ class AuditLogger:
                 "actor": actor,
                 "action": action,
                 "resource": resource,
-                "details": details,
+                "details": canonical_details,
                 "previous_hash": self._last_hash,
             }
 
@@ -178,7 +301,7 @@ class AuditLogger:
                 actor=actor,
                 action=action,
                 resource=resource,
-                details=details,
+                details=frozen_details,
                 previous_hash=self._last_hash,
                 event_hash=event_hash,
             )
@@ -246,7 +369,10 @@ class AuditLogger:
         if not self._events:
             return True, None
 
-        expected_prev = "genesis"
+        # Start from the chain anchor, which advances every time retention
+        # purges events. For a logger that has never purged anything the
+        # anchor is still "genesis", matching the very first log() call.
+        expected_prev = self._anchor_hash
         for i, event in enumerate(self._events):
             if event.previous_hash != expected_prev:
                 return False, {
@@ -264,7 +390,10 @@ class AuditLogger:
                 "actor": event.actor,
                 "action": event.action,
                 "resource": event.resource,
-                "details": event.details,
+                # event.details is a read-only MappingProxyType (deep-frozen).
+                # Convert back to plain dict/list so the hash matches the one
+                # computed at log() time on the plain isolated payload.
+                "details": _to_plain(event.details),
                 "previous_hash": event.previous_hash,
             }
             computed = self._compute_hash(event_data)
@@ -317,7 +446,9 @@ class AuditLogger:
                 "actor": e.actor,
                 "action": e.action,
                 "resource": e.resource,
-                "details": self._sanitize_value(e.details),
+                # event.details is frozen; convert to plain containers first so
+                # _sanitize_value works uniformly with dicts/lists.
+                "details": self._sanitize_value(_to_plain(e.details)),
                 "previous_hash": e.previous_hash,
                 "event_hash": e.event_hash,
             })

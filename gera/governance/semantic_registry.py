@@ -7,6 +7,7 @@ validation. Ensures consistent business terminology across
 enterprise data systems.
 """
 
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -62,24 +63,57 @@ class SemanticRegistry:
 
     Provides registration, versioning, search, and conformance
     validation for enterprise metrics.
+
+    Mutation policy (copy-on-write / copy-on-read):
+
+    * :meth:`register` deep-copies the caller's MetricDefinition before
+      storing it, so subsequent caller-side mutation does not change the
+      registered record.
+    * :meth:`get` returns a deep copy of the stored record, so external
+      code cannot bypass :meth:`update`'s versioning by mutating a shared
+      reference. All internal callers (:meth:`search`, :meth:`update`,
+      :meth:`validate_conformance`, :meth:`export_glossary`) operate on
+      the stored objects directly.
+
+    This guarantees that every versioned change to a metric goes through
+    :meth:`update` — which is the only path that bumps ``version`` and
+    sets ``updated_at``.
     """
 
     def __init__(self):
         self._metrics: Dict[str, MetricDefinition] = {}
 
     def register(self, metric: MetricDefinition) -> MetricDefinition:
-        """Register a new metric. Raises ValueError if name already exists."""
+        """
+        Register a new metric (copy-on-write).
+
+        Deep-copies the provided ``metric`` before storing so subsequent
+        caller-side mutation does not affect the registry's record.
+
+        Returns a deep copy of the stored definition so the caller cannot
+        mutate the registry's internal state through the returned handle
+        either.
+
+        Raises:
+            ValueError: if the metric name is already registered.
+        """
         if metric.name in self._metrics:
             raise ValueError(
                 f"Metric '{metric.name}' already registered. "
                 "Use update() to modify."
             )
-        self._metrics[metric.name] = metric
-        return metric
+        self._metrics[metric.name] = copy.deepcopy(metric)
+        return copy.deepcopy(self._metrics[metric.name])
 
     def get(self, name: str) -> Optional[MetricDefinition]:
-        """Get a metric by name. Returns None if not found."""
-        return self._metrics.get(name)
+        """
+        Get a metric by name (copy-on-read).
+
+        Returns a deep copy so external mutation cannot bypass
+        :meth:`update`'s versioning. Returns None if not found.
+        """
+        stored = self._metrics.get(name)
+        return copy.deepcopy(stored) if stored is not None else None
 
     def update(self, metric_name: str, **kwargs) -> MetricDefinition:
         """
@@ -115,13 +149,16 @@ class SemanticRegistry:
 
         metric.version += 1
         metric.updated_at = datetime.now(timezone.utc)
-        return metric
+        # Return a deep copy so the caller cannot bypass versioning by
+        # mutating the returned reference.
+        return copy.deepcopy(metric)
 
     def search(self, query: str) -> List[MetricDefinition]:
-        """Search metrics by name or description."""
+        """Search metrics by name or description (copy-on-read)."""
         query_lower = query.lower()
         return [
-            m for m in self._metrics.values()
+            copy.deepcopy(m)
+            for m in self._metrics.values()
             if query_lower in m.name.lower()
             or query_lower in m.description.lower()
         ]

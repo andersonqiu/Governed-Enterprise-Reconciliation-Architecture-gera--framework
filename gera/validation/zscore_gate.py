@@ -81,18 +81,32 @@ class ZScoreGate:
     """
     Statistical anomaly detection gate for financial data pipelines.
 
-    Uses modified Z-Score analysis with configurable thresholds to
-    classify records as PASS, FLAG, or BLOCK. Supports rolling
-    baseline windows and per-segment calibration.
+    Uses (modified) Z-Score analysis with configurable thresholds to
+    classify records as PASS, FLAG, or BLOCK. Supports rolling baseline
+    windows, per-segment calibration, and two scoring methods:
+
+    * ``method="zscore"`` (default) — classic (x − mean) / std scoring.
+      Sensitive to extreme values in the baseline itself.
+    * ``method="mad"`` — modified Z-Score per Iglewicz & Hoaglin (1993):
+      ``0.6745 * (x − median) / MAD``. More robust when the historical
+      baseline contains outliers (e.g., a prior-period fraud event
+      contaminating the training window).
+
+    The MAD option is useful for long-tail financial distributions where
+    a handful of historical outliers would otherwise inflate std and
+    mask new anomalies.
 
     Args:
-        sigma_threshold: Z-Score threshold for FLAG (default: 2.5)
-        block_threshold: Z-Score threshold for BLOCK (default: 4.0)
+        sigma_threshold: Threshold for FLAG (default: 2.5)
+        block_threshold: Threshold for BLOCK (default: 4.0)
         window_days: Rolling baseline window in days (default: 90)
         min_observations: Minimum records for valid baseline (default: 30)
-        batch_anomaly_rate_limit: Max anomaly rate before batch BLOCK (default: 0.10),
-            must be strictly between 0 and 1.
+        batch_anomaly_rate_limit: Max anomaly rate before batch BLOCK
+            (default: 0.10), must be strictly between 0 and 1.
+        method: Scoring method, ``"zscore"`` or ``"mad"`` (default: ``"zscore"``).
     """
+
+    _MAD_SCALE = 0.6745  # Iglewicz & Hoaglin constant: MAD → robust σ̂.
 
     def __init__(
         self,
@@ -101,6 +115,7 @@ class ZScoreGate:
         window_days: int = 90,
         min_observations: int = 30,
         batch_anomaly_rate_limit: float = 0.10,
+        method: str = "zscore",
     ):
         if sigma_threshold <= 0:
             raise ValueError("sigma_threshold must be positive")
@@ -115,12 +130,17 @@ class ZScoreGate:
                 "batch_anomaly_rate_limit must be strictly between 0 and 1, "
                 f"got {batch_anomaly_rate_limit}"
             )
+        if method not in ("zscore", "mad"):
+            raise ValueError(
+                f"method must be 'zscore' or 'mad', got {method!r}"
+            )
 
         self.sigma_threshold = sigma_threshold
         self.block_threshold = block_threshold
         self.window_days = window_days
         self.min_observations = min_observations
         self.batch_anomaly_rate_limit = batch_anomaly_rate_limit
+        self.method = method
 
     def compute_baseline(
         self,
@@ -130,8 +150,14 @@ class ZScoreGate:
         """
         Compute baseline statistics from historical data.
 
+        For ``method="zscore"`` returns ``(mean, std, is_valid)``.
+        For ``method="mad"`` returns ``(median, MAD, is_valid)`` where
+        MAD is the median absolute deviation; ``evaluate_record`` scales
+        by 0.6745 to obtain a modified Z-Score comparable to the sigma
+        thresholds.
+
         Returns:
-            Tuple of (mean, std, is_valid) where is_valid indicates
+            Tuple of (center, scale, is_valid) where is_valid indicates
             whether sufficient observations exist for a reliable baseline.
         """
         if timestamps is not None:
@@ -147,6 +173,10 @@ class ZScoreGate:
             return 0.0, 0.0, False
 
         arr = np.array(filtered, dtype=np.float64)
+        if self.method == "mad":
+            median = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - median)))
+            return median, mad, True
         return float(np.mean(arr)), float(np.std(arr, ddof=1)), True
 
     def evaluate_record(
@@ -157,9 +187,20 @@ class ZScoreGate:
         record_id: str = "",
         segment: Optional[str] = None,
     ) -> Anomaly:
-        """Evaluate a single record against the baseline."""
+        """
+        Evaluate a single record against the baseline.
+
+        The ``baseline_mean`` / ``baseline_std`` parameter names are
+        retained for backwards compatibility — under ``method="mad"``
+        the two arguments carry ``(median, MAD)`` instead.
+        """
         if baseline_std == 0:
             z_score = 0.0 if value == baseline_mean else float('inf')
+        elif self.method == "mad":
+            # Modified Z-Score (Iglewicz & Hoaglin, 1993): the 0.6745
+            # constant scales MAD to an σ̂ comparable to a Gaussian std,
+            # so the same sigma_threshold / block_threshold apply.
+            z_score = abs(self._MAD_SCALE * (value - baseline_mean) / baseline_std)
         else:
             z_score = abs(value - baseline_mean) / baseline_std
 
@@ -275,6 +316,14 @@ class ZScoreGate:
 
         Different business segments may have different normal ranges.
         This method computes separate baselines per segment.
+
+        Fail-closed on insufficient baseline: when a segment lacks
+        :attr:`min_observations` historical values, the record cannot be
+        statistically evaluated, so it is FLAGged for manual review
+        rather than PASSed silently. Passing an unvalidated record
+        without any signal is a compliance risk in regulated pipelines
+        (a new segment, a data-pipeline outage, or a cold-start
+        scenario can otherwise slip through unnoticed).
         """
         if record_ids is None:
             record_ids = [f"record-{i}" for i in range(len(values))]
@@ -287,7 +336,20 @@ class ZScoreGate:
             mean, std, is_valid = self.compute_baseline(hist)
 
             if not is_valid:
-                passed += 1
+                # Insufficient baseline — FLAG for manual review.
+                # The Anomaly carries z_score=0.0 and baseline_*=0.0 as
+                # sentinels that the evaluation was baseline-less.
+                flagged += 1
+                all_anomalies.append(Anomaly(
+                    record_id=rid,
+                    value=val,
+                    z_score=0.0,
+                    decision=GateDecision.FLAG,
+                    baseline_mean=0.0,
+                    baseline_std=0.0,
+                    segment=seg,
+                    timestamp=datetime.now(timezone.utc),
+                ))
                 continue
 
             result = self.evaluate_record(val, mean, std, rid, segment=seg)

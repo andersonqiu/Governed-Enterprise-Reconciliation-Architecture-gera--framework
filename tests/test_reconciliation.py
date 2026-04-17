@@ -340,7 +340,11 @@ class TestSemanticRegistry:
         m = self._make_metric()
         self.registry.register(m)
         retrieved = self.registry.get("revenue_total")
-        assert retrieved is m
+        # Registry deep-copies on register and on get so that external
+        # callers cannot bypass update()'s versioning. The returned object
+        # must therefore be a structural equal but a distinct instance.
+        assert retrieved is not m
+        assert retrieved == m
         assert retrieved.name == "revenue_total"
 
     def test_get_nonexistent_returns_none(self):
