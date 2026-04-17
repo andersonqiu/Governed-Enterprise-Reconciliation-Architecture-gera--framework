@@ -7,7 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
-A four-layer, open-source framework for cross-system financial data reconciliation, statistical validation, semantic governance, and security controls in regulated enterprises.
+A four-layer, open-source framework for cross-system financial data reconciliation, statistical validation, semantic governance, and security controls in regulated enterprises. **Cloud-agnostic** by design — reference implementations are provided for both **AWS** (Lake Formation + Glue + S3) and **GCP** (BigQuery + Cloud IAM), with matching SQL DDL and Terraform modules for each.
 
 Companion code for the arXiv preprint *"Data Engineering Patterns for Cross-System Reconciliation in Regulated Enterprises: Architecture, Anomaly Detection, and Governance"* ([arXiv:2604.15108](https://arxiv.org/abs/2604.15108)).
 
@@ -49,7 +49,8 @@ Financial enterprises operating under SOX Section 404, PCAOB standards, and NIST
 - **Statistical anomaly detection** using Z-Score gates with configurable thresholds
 - **Governed semantic definitions** with versioned metric registries
 - **Tamper-evident audit logging** with SHA-256 hash chaining (7-year SOX retention)
-- **Policy-as-Code security** via Terraform templates for BigQuery RLS and ABAC
+- **Policy-as-Code security** via Terraform templates for **BigQuery RLS (GCP)** and **Lake Formation RLS (AWS)**, plus ABAC roles
+- **Dual-cloud reference DDL** (`sql/bigquery/` and `sql/athena/`) aligned with the Terraform modules so row-level security policies attach to real, documented table schemas
 
 ## Quick Start
 
@@ -80,7 +81,11 @@ assert logger.verify_chain()  # Verify no tampering
 | `gera.validation` | 2 | Z-Score anomaly detection + reconciliation checks |
 | `gera.governance` | 3 | Semantic registry + append-only audit logging |
 | `gera.nist` | 4 | NIST CSF 2.0 control mapping + compliance reports |
-| `terraform/` | 4 | BigQuery RLS, ABAC roles, audit sink templates |
+| `sql/bigquery/` | All | GCP BigQuery DDL for audit log, semantic registry, reconciliation results, exceptions queue, Z-score baseline |
+| `sql/athena/` | All | AWS Athena / Glue DDL (same schema, AWS-native types and partitioning) |
+| `terraform/bigquery_rls/` | 4 | GCP BigQuery row-level security + ABAC via Cloud IAM groups |
+| `terraform/lakeformation_rls/` | 4 | AWS Lake Formation data cells filters + ABAC via IAM groups |
+| `terraform/abac/`, `terraform/audit_logging/` | 4 | Shared ABAC roles and append-only audit sink templates |
 
 ## Regulatory Alignment
 
@@ -89,7 +94,7 @@ assert logger.verify_chain()  # Verify no tampering
 | SOX Section 404 | Hash-chained audit trail, 7-year retention |
 | PCAOB AS 2201 | Deterministic reconciliation + statistical validation |
 | NIST CSF 2.0 GV.OC | Sensitivity classification in SemanticRegistry |
-| NIST CSF 2.0 PR.AA | Terraform ABAC + BigQuery Row-Level Security |
+| NIST CSF 2.0 PR.AA | Terraform ABAC + BigQuery Row-Level Security (GCP) + Lake Formation Data Cells Filters (AWS) |
 | NIST CSF 2.0 DE.CM | Real-time gate decisions + exception routing |
 
 ## Installation
