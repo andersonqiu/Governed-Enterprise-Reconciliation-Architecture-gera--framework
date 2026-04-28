@@ -8,9 +8,11 @@ generation for regulated enterprises.
 Mapped controls:
 - GV.OC: Organizational Context (sensitivity classification)
 - GV.RM: Risk Management (anomaly detection thresholds)
+- ID.AM: Asset Management (data assets and data-flow lineage)
 - PR.AA: Identity Management & Access Control (ABAC + RLS)
 - PR.DS: Data Security (hash chain + append-only audit)
 - DE.CM: Continuous Monitoring (real-time gate decisions)
+- RS.MA: Incident Management (exception severity and escalation evidence)
 """
 
 from dataclasses import dataclass, field
@@ -65,6 +67,26 @@ GERA_CSF2_MAPPINGS: List[CSF2Control] = [
         evidence_artifacts=[
             "zscore_gate_config.json",
             "gate_decision_audit_log.json",
+        ],
+    ),
+    CSF2Control(
+        control_id="ID.AM-07",
+        function_name="IDENTIFY",
+        category="Asset Management",
+        description=(
+            "Inventories of data and corresponding metadata are "
+            "maintained"
+        ),
+        gera_implementation=(
+            "Layer A ingestion manifests record source extracts, schemas, "
+            "checksums, and load metadata. Layer D semantic registry entries "
+            "preserve metric lineage to source tables and reconciliation "
+            "entities so data assets and flows are reviewable."
+        ),
+        evidence_artifacts=[
+            "ingestion_manifest.json",
+            "semantic_registry_export.json",
+            "source_lineage_report.json",
         ],
     ),
     CSF2Control(
@@ -123,6 +145,21 @@ GERA_CSF2_MAPPINGS: List[CSF2Control] = [
         evidence_artifacts=[
             "gate_decision_audit_log.json",
             "exception_queue_summary.json",
+        ],
+    ),
+    CSF2Control(
+        control_id="RS.MA-04",
+        function_name="RESPOND",
+        category="Incident Management",
+        description="Incidents are escalated or elevated as needed",
+        gera_implementation=(
+            "ExceptionRouter assigns owner, severity, service-level "
+            "thresholds, and escalation metadata for reconciliation "
+            "exceptions that require operational response."
+        ),
+        evidence_artifacts=[
+            "exception_queue_summary.json",
+            "exception_sla_report.json",
         ],
     ),
 ]
